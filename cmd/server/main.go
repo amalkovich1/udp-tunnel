@@ -112,10 +112,6 @@ func handleKCP(kcpConn *kcp.UDPSession) {
 				return
 			}
 			// Send length prefix
-			lenPref := []byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
-			if _, err := kcpConn.Write(lenPref); err != nil {
-				return
-			}
 			log.Printf("TCP→KCP %s: write %d bytes", target, n)
 			if _, err := kcpConn.Write(buf[:n]); err != nil {
 				return

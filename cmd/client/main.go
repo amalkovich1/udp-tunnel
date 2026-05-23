@@ -140,17 +140,11 @@ func handle(client net.Conn) {
 				return
 			default:
 			}
-			if _, err := kcpConn.Read(buf[:4]); err != nil {
+			n, err := kcpConn.Read(buf)
+			if err != nil {
 				return
 			}
-			pktLen := int(buf[0])<<24 | int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])
-			if pktLen < 1 || pktLen > 4096 {
-				return
-			}
-			if _, err := kcpConn.Read(buf[:pktLen]); err != nil {
-				return
-			}
-			if _, err := client.Write(buf[:pktLen]); err != nil {
+			if _, err := client.Write(buf[:n]); err != nil {
 				return
 			}
 		}
