@@ -100,3 +100,27 @@ type Stats struct {
 func NewStats() *Stats {
 	return &Stats{StartTime: time.Now()}
 }
+
+// EncodeTargetInfo packs host:port into [4B hostLen][host][2B port]
+func EncodeTargetInfo(host string, port uint16) []byte {
+	hostBytes := []byte(host)
+	buf := make([]byte, 4+len(hostBytes)+2)
+	binary.BigEndian.PutUint32(buf[:4], uint32(len(hostBytes)))
+	copy(buf[4:], hostBytes)
+	binary.BigEndian.PutUint16(buf[4+len(hostBytes):], port)
+	return buf
+}
+
+// DecodeTargetInfo extracts host and port from target info packet
+func DecodeTargetInfo(data []byte) (string, uint16, error) {
+	if len(data) < 6 {
+		return "", 0, io.ErrUnexpectedEOF
+	}
+	hostLen := binary.BigEndian.Uint32(data[:4])
+	if len(data) < int(4+hostLen+2) {
+		return "", 0, io.ErrUnexpectedEOF
+	}
+	host := string(data[4 : 4+hostLen])
+	port := binary.BigEndian.Uint16(data[4+hostLen:])
+	return host, port, nil
+}

@@ -3,39 +3,23 @@ package main
 import (
 	"encoding/binary"
 	"flag"
-	"crypto/cipher"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
 	"time"
 
 	"github.com/amalkovich1/udp-tunnel/pkg/tunnel"
+	kcp "github.com/xtaci/kcp-go"
 )
 
 var (
-	listenAddr = flag.String("listen", "127.0.0.1:10800", "SOCKS5 listen address")
-	serverAddr = flag.String("server", "161.97.94.240:40000", "UDP server address")
-	password   = flag.String("pass", "werther-tunnel-2026", "Encryption password")
+	listenAddr = flag.String("listen", "127.0.0.1:10800", "SOCKS5 listen addr")
+	serverAddr = flag.String("server", "161.97.94.240:40000", "KCP server addr")
 )
 
 func main() {
 	flag.Parse()
-
-	key := tunnel.DeriveKey(*password)
-	aead, err := tunnel.NewAEAD(key)
-	if err != nil {
-		log.Fatalf("Failed to create AEAD: %v", err)
-	}
-
-	serverUDP, err := net.ResolveUDPAddr("udp", *serverAddr)
-	if err != nil {
-		log.Fatalf("Resolve server: %v", err)
-	}
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -43,30 +27,20 @@ func main() {
 	}
 	defer listener.Close()
 
-	log.Printf("UDP tunnel client (SOCKS5) started on %s", *listenAddr)
-	log.Printf("Server: %s", *serverAddr)
-	log.Printf("Encryption: ChaCha20-Poly1305")
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("Shutting down...")
-		listener.Close()
-		os.Exit(0)
-	}()
+	log.Printf("KCP tunnel client (SOCKS5) on %s", *listenAddr)
+	log.Printf("KCP server: %s", *serverAddr)
 
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			log.Printf("Accept: %v", err)
 			break
 		}
-		go handle(client, aead, serverUDP)
+		go handle(client)
 	}
 }
 
-func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr) {
+func handle(client net.Conn) {
 	defer client.Close()
 
 	buf := make([]byte, 4096)
@@ -83,7 +57,7 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr) {
 	}
 	client.Write([]byte{0x05, 0x00})
 
-	// 2. Read SOCKS5 request
+	// 2. SOCKS5 request
 	_, err = io.ReadAtLeast(client, buf[:4], 4)
 	if err != nil {
 		return
@@ -98,97 +72,84 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr) {
 	var port uint16
 	switch atyp {
 	case 1:
-		_, err = io.ReadFull(client, buf[:4])
+		io.ReadFull(client, buf[:4])
 		host = net.IP(buf[:4]).String()
 	case 3:
-		_, err = io.ReadFull(client, buf[:1])
-		if err != nil {
-			return
-		}
+		io.ReadFull(client, buf[:1])
 		hostLen := buf[0]
-		_, err = io.ReadFull(client, buf[:hostLen])
-		if err != nil {
-			return
-		}
+		io.ReadFull(client, buf[:hostLen])
 		host = string(buf[:hostLen])
 	case 4:
-		_, err = io.ReadFull(client, buf[:16])
+		io.ReadFull(client, buf[:16])
 		host = net.IP(buf[:16]).String()
 	}
-	if err != nil {
-		return
-	}
-	_, err = io.ReadFull(client, buf[:2])
-	if err != nil {
-		return
-	}
+	io.ReadFull(client, buf[:2])
 	port = binary.BigEndian.Uint16(buf[:2])
 	target := fmt.Sprintf("%s:%d", host, port)
 	log.Printf("CONNECT %s", target)
 
-	// 3. Connect to UDP server
-	remote, err := net.DialUDP("udp", nil, serverAddr)
+	// 3. Connect to KCP server
+		block, _ := kcp.NewNoneBlockCrypt(nil)
+		kcpConn, err := kcp.DialWithOptions(*serverAddr, block, 0, 0)
 	if err != nil {
+		log.Printf("KCP dial: %v", err)
 		return
 	}
-	defer remote.Close()
+	defer kcpConn.Close()
 
-	// 4. Send target info
-	hostBytes := []byte(host)
-	targetInfo := make([]byte, 4+len(hostBytes)+2)
-	binary.BigEndian.PutUint32(targetInfo[:4], uint32(len(hostBytes)))
-	copy(targetInfo[4:], hostBytes)
-	binary.BigEndian.PutUint16(targetInfo[4+len(hostBytes):], port)
-	tgtPkt := &tunnel.Packet{Data: targetInfo}
-	remote.Write(tgtPkt.Encrypt(aead))
+	// Fast mode
+	kcpConn.SetNoDelay(1, 10, 2, 1)
+	kcpConn.SetWindowSize(1024, 1024)
+	kcpConn.SetMtu(1400)
+	kcpConn.SetACKNoDelay(true)
+
+	// 4. Send target info first
+	targetInfo := tunnel.EncodeTargetInfo(host, port)
+	_, err = kcpConn.Write(targetInfo)
+	if err != nil {
+		log.Printf("KCP write targetInfo: %v", err)
+		return
+	}
 
 	// 5. SOCKS5 OK
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 
 	// 6. Bidirectional relay
-	var wg sync.WaitGroup
-	wg.Add(2)
+	done := make(chan struct{}, 2)
 
-	// UDP -> TCP: read responses from server, write to SOCKS5 client
+	// SOCKS5 → KCP
 	go func() {
-		defer wg.Done()
-		buf := make([]byte, 4096)
-		for {
-			remote.SetReadDeadline(time.Now().Add(5 * time.Minute))
-			n, err := remote.Read(buf)
-			if err != nil {
-				return
-			}
-			raw := buf[:n]
-			if tunnel.IsHeartbeat(raw) {
-				continue
-			}
-			pkt, err := tunnel.DecryptPacket(raw, aead)
-			if err != nil {
-				continue
-			}
-			if pkt.Data != nil {
-				_, err := client.Write(pkt.Data)
-				if err != nil {
-					return
-				}
-			}
-		}
-	}()
-
-	// TCP -> UDP: read from SOCKS5 client, send to server
-	go func() {
-		defer wg.Done()
+		defer func() { done <- struct{}{} }()
 		buf := make([]byte, 4096)
 		for {
 			n, err := client.Read(buf)
 			if err != nil {
 				return
 			}
-			pkt := &tunnel.Packet{Data: buf[:n]}
-			remote.Write(pkt.Encrypt(aead))
+			_, err = kcpConn.Write(buf[:n])
+			if err != nil {
+				return
+			}
 		}
 	}()
 
-	wg.Wait()
+	// KCP → SOCKS5
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, 4096)
+		for {
+			kcpConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			n, err := kcpConn.Read(buf)
+			if err != nil {
+				return
+			}
+			_, err = client.Write(buf[:n])
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	<-done
+	log.Printf("Disconnected %s", target)
 }
