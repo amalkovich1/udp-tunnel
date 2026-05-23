@@ -1,9 +1,9 @@
 package main
 
 import (
-	"crypto/cipher"
 	"encoding/binary"
 	"flag"
+	"crypto/cipher"
 	"fmt"
 	"io"
 	"log"
@@ -47,8 +47,6 @@ func main() {
 	log.Printf("Server: %s", *serverAddr)
 	log.Printf("Encryption: ChaCha20-Poly1305")
 
-	var wg sync.WaitGroup
-
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -58,46 +56,42 @@ func main() {
 		os.Exit(0)
 	}()
 
+	var wg sync.WaitGroup
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
 			break
 		}
 		wg.Add(1)
-		go handleSOCKS5(client, serverUDP, aead, &wg)
+		go handle(client, aead, serverUDP, &wg)
 	}
 	wg.Wait()
 }
 
-// SOCKS5 handshake
-func handleSOCKS5(client net.Conn, serverAddr *net.UDPAddr, aead cipher.AEAD, wg *sync.WaitGroup) {
+func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync.WaitGroup) {
 	defer client.Close()
 	defer wg.Done()
 
-	// 1. Read auth methods
-	buf := make([]byte, 257)
-// 	_, err := io.ReadAtLeast(client, buf[:2], 2)
+	// 1. SOCKS5 auth
+	buf := make([]byte, 512)
 	_, err := io.ReadAtLeast(client, buf[:2], 2)
 	if err != nil {
 		return
 	}
 	nmethods := buf[1]
-  _, err = io.ReadAtLeast(client, buf[:nmethods], int(nmethods))
+	_, err = io.ReadAtLeast(client, buf[:nmethods], int(nmethods))
 	if err != nil {
 		return
 	}
-
-	// 2. Reply: no auth
 	client.Write([]byte{0x05, 0x00})
 
-	// 3. Read request
-  _, err = io.ReadAtLeast(client, buf[:4], 4)
+	// 2. SOCKS5 request
+	_, err = io.ReadAtLeast(client, buf[:4], 4)
 	if err != nil {
 		return
 	}
-	ver, cmd, _, atyp := buf[0], buf[1], buf[2], buf[3]
-	if ver != 5 || cmd != 1 { // only CONNECT
+	ver, cmd, atyp := buf[0], buf[1], buf[3]
+	if ver != 5 || cmd != 1 {
 		client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		return
 	}
@@ -105,47 +99,24 @@ func handleSOCKS5(client net.Conn, serverAddr *net.UDPAddr, aead cipher.AEAD, wg
 	var host string
 	var port uint16
 	switch atyp {
-	case 1: // IPv4
-  _, err = io.ReadAtLeast(client, buf[:4], 4)
-		if err != nil {
-			return
-		}
+	case 1:
+		io.ReadFull(client, buf[:4])
 		host = net.IP(buf[:4]).String()
-	case 3: // Domain
-  _, err = io.ReadAtLeast(client, buf[:1], 1)
-		if err != nil {
-			return
-		}
+	case 3:
+		io.ReadFull(client, buf[:1])
 		len := buf[0]
-  _, err = io.ReadAtLeast(client, buf[:len], int(len))
-		if err != nil {
-			return
-		}
+		io.ReadFull(client, buf[:len])
 		host = string(buf[:len])
-	case 4: // IPv6
-  _, err = io.ReadAtLeast(client, buf[:16], 16)
-		if err != nil {
-			return
-		}
+	case 4:
+		io.ReadFull(client, buf[:16])
 		host = net.IP(buf[:16]).String()
-	default:
-		return
 	}
-  _, err = io.ReadAtLeast(client, buf[:2], 2)
-	if err != nil {
-		return
-	}
+	io.ReadFull(client, buf[:2])
 	port = binary.BigEndian.Uint16(buf[:2])
-
 	target := fmt.Sprintf("%s:%d", host, port)
 	log.Printf("CONNECT %s", target)
 
-	// 4. Reply success (we'll send actual response after UDP relay)
-	// Defer sending reply until we get first data back
-	replyOK := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	client.Write(replyOK)
-
-	// 5. Relay via UDP tunnel
+	// 3. Connect to server via UDP
 	remote, err := net.DialUDP("udp", nil, serverAddr)
 	if err != nil {
 		log.Printf("Dial UDP: %v", err)
@@ -153,73 +124,48 @@ func handleSOCKS5(client net.Conn, serverAddr *net.UDPAddr, aead cipher.AEAD, wg
 	}
 	defer remote.Close()
 
-	// Send target info first: 4 bytes hostLen + host + 2 bytes port
+	// Send target info
 	hostBytes := []byte(host)
 	targetInfo := make([]byte, 4+len(hostBytes)+2)
 	binary.BigEndian.PutUint32(targetInfo[:4], uint32(len(hostBytes)))
 	copy(targetInfo[4:], hostBytes)
 	binary.BigEndian.PutUint16(targetInfo[4+len(hostBytes):], port)
 
-	// Send as first packet — server will connect to this target
 	tgtPkt := &tunnel.Packet{Data: targetInfo}
 	remote.Write(tgtPkt.Encrypt(aead))
 
-	// Wait for OK from server
-	respBuf := make([]byte, 2048)
-	remote.SetReadDeadline(time.Now().Add(10 * time.Second))
-	respN, err := remote.Read(respBuf)
-	if err == nil {
-		respRaw := respBuf[:respN]
-		if !tunnel.IsHeartbeat(respRaw) {
-			respPkt, err := tunnel.DecryptPacket(respRaw, aead)
-			if err == nil && respPkt.Data != nil && len(respPkt.Data) > 0 {
-				client.Write(respPkt.Data)
-			}
+	// 4. Reply SOCKS5 OK
+	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+
+	// 5. Sequential relay: write then read
+	for {
+		// Read from SOCKS5 client
+		n, err := client.Read(buf)
+		if err != nil {
+			return
+		}
+		data := buf[:n]
+
+		// Encrypt & send UDP
+		pkt := &tunnel.Packet{Data: data}
+		remote.Write(pkt.Encrypt(aead))
+
+		// Wait for response from server (UDP)
+		remote.SetReadDeadline(time.Now().Add(30 * time.Second))
+		respN, err := remote.Read(buf)
+		if err != nil {
+			return
+		}
+		raw := buf[:respN]
+		if tunnel.IsHeartbeat(raw) {
+			continue
+		}
+		respPkt, err := tunnel.DecryptPacket(raw, aead)
+		if err != nil {
+			continue
+		}
+		if respPkt.Data != nil {
+			client.Write(respPkt.Data)
 		}
 	}
-
-	// Bidirectional relay
-	var wg2 sync.WaitGroup
-	wg2.Add(2)
-
-	// Client → Server
-	go func() {
-		defer wg2.Done()
-		buf := make([]byte, 2048)
-		for {
-			n, err := client.Read(buf)
-			if err != nil {
-				return
-			}
-			data := buf[:n]
-			pkt := &tunnel.Packet{Data: data}
-			remote.Write(pkt.Encrypt(aead))
-		}
-	}()
-
-	// Server → Client
-	go func() {
-		defer wg2.Done()
-		buf := make([]byte, 2048)
-		for {
-			remote.SetReadDeadline(time.Now().Add(120 * time.Second))
-			n, err := remote.Read(buf)
-			if err != nil {
-				return
-			}
-			raw := buf[:n]
-			if tunnel.IsHeartbeat(raw) {
-				continue
-			}
-			pkt, err := tunnel.DecryptPacket(raw, aead)
-			if err != nil {
-				continue
-			}
-			if pkt.Data != nil {
-				client.Write(pkt.Data)
-			}
-		}
-	}()
-
-	wg2.Wait()
 }
