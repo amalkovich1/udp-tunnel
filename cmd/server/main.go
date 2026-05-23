@@ -1,7 +1,8 @@
 package main
 
 import (
-	"context"
+	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -9,116 +10,175 @@ import (
 	"time"
 
 	"github.com/amalkovich1/udp-tunnel/pkg/tunnel"
-	kcp "github.com/xtaci/kcp-go"
+)
+
+var (
+	listenAddr = flag.String("listen", ":40000", "UDP listen address")
+	password   = flag.String("pass", "werther-tunnel-2026", "Encryption password")
 )
 
 func main() {
-	block, _ := kcp.NewNoneBlockCrypt(nil)
-	lis, err := kcp.ListenWithOptions(":40000", block, 0, 0)
+	flag.Parse()
+
+	key := tunnel.DeriveKey(*password)
+	aead, err := tunnel.NewAEAD(key)
 	if err != nil {
-		log.Fatalf("KCP listen: %v", err)
+		log.Fatalf("Failed to create AEAD: %v", err)
 	}
-	defer lis.Close()
-	log.Printf("KCP tunnel server on :40000")
+
+	udpAddr, err := net.ResolveUDPAddr("udp", *listenAddr)
+	if err != nil {
+		log.Fatalf("Resolve UDP: %v", err)
+	}
+
+	conn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		log.Fatalf("Listen UDP: %v", err)
+	}
+	defer conn.Close()
+
+	log.Printf("UDP tunnel server started on %s", conn.LocalAddr())
+	log.Printf("Encryption: ChaCha20-Poly1305")
+
+	type session struct {
+		clientAddr *net.UDPAddr
+		target     string
+		tcpConn    net.Conn
+		lastSeen   time.Time
+		mu         sync.Mutex
+	}
+	sessions := make(map[string]*session)
+	var mu sync.Mutex
+
+	buf := make([]byte, 1400)
+
+	// Helper: ensure TCP connection is alive, reconnect if needed
+	ensureConn := func(s *session) (net.Conn, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.tcpConn != nil {
+			return s.tcpConn, nil
+		}
+		tcpConn, err := net.DialTimeout("tcp", s.target, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		s.tcpConn = tcpConn
+		// Start reader goroutine for new connection
+		go func(s *session) {
+			buf := make([]byte, 1400)
+			for {
+				tcpConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+				n, err := tcpConn.Read(buf)
+				if err != nil {
+					s.mu.Lock()
+					tcpConn.Close()
+					s.tcpConn = nil // mark as closed, will reconnect on next write
+					s.mu.Unlock()
+					return
+				}
+				pkt := &tunnel.Packet{Data: buf[:n]}
+				conn.WriteToUDP(pkt.Encrypt(aead), s.clientAddr)
+			}
+		}(s)
+		return tcpConn, nil
+	}
+
+	writeToSession := func(s *session, data []byte) bool {
+		tcpConn, err := ensureConn(s)
+		if err != nil {
+			return false
+		}
+		_, err = tcpConn.Write(data)
+		if err != nil {
+			tcpConn.Close()
+			s.mu.Lock()
+			s.tcpConn = nil
+			s.mu.Unlock()
+			return false
+		}
+		return true
+	}
 
 	for {
-		conn, err := lis.AcceptKCP()
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				mu.Lock()
+				now := time.Now()
+				for key, s := range sessions {
+					if now.Sub(s.lastSeen) > 5*time.Minute {
+						s.mu.Lock()
+						if s.tcpConn != nil {
+							s.tcpConn.Close()
+						}
+						s.mu.Unlock()
+						delete(sessions, key)
+						log.Printf("Session %s timed out", key)
+					}
+				}
+				mu.Unlock()
+				continue
+			}
+			log.Printf("Read error: %v", err)
 			continue
 		}
-		conn.SetNoDelay(1, 10, 2, 1)
-		conn.SetWindowSize(1024, 1024)
-		conn.SetMtu(1400)
-		conn.SetACKNoDelay(true)
-		conn.SetStreamMode(false)
-		go handleKCP(conn)
-	}
-}
 
-func handleKCP(kcpConn *kcp.UDPSession) {
-	clientAddr := kcpConn.RemoteAddr().String()
-	defer kcpConn.Close()
+		raw := buf[:n]
+		keyStr := clientAddr.String()
 
-	buf := make([]byte, 4096)
-	n, err := kcpConn.Read(buf)
-	if err != nil {
-		return
-	}
-	host, port, err := tunnel.DecodeTargetInfo(buf[:n])
-	if err != nil {
-		return
-	}
-	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	log.Printf("KCP %s -> %s", clientAddr, target)
-
-	tcpConn, err := net.DialTimeout("tcp", target, 10*time.Second)
-	if err != nil {
-		log.Printf("TCP dial %s: %v", target, err)
-		return
-	}
-	defer tcpConn.Close()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	// KCP → TCP: read len + data, write to target
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		buf := make([]byte, 4096)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
+		if tunnel.IsHeartbeat(raw) {
+			mu.Lock()
+			if s, ok := sessions[keyStr]; ok {
+				s.lastSeen = time.Now()
 			}
-			// Read 4 bytes length prefix
-			if _, err := kcpConn.Read(buf[:4]); err != nil {
-				return
+			mu.Unlock()
+			continue
+		}
+
+		pkt, err := tunnel.DecryptPacket(raw, aead)
+		if err != nil {
+			log.Printf("Decrypt error from %s: %v", clientAddr, err)
+			continue
+		}
+
+		mu.Lock()
+		s, exists := sessions[keyStr]
+		mu.Unlock()
+
+		if !exists {
+			if len(pkt.Data) < 6 {
+				log.Printf("Bad initial packet from %s", clientAddr)
+				continue
 			}
-			pktLen := int(buf[0])<<24 | int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])
-			if pktLen < 1 || pktLen > 4096 {
-				return
+			hostLen := binary.BigEndian.Uint32(pkt.Data[:4])
+			if len(pkt.Data) < int(4+hostLen+2) {
+				continue
 			}
-			// Read data
-			if _, err := kcpConn.Read(buf[:pktLen]); err != nil {
-				return
-			}
-			log.Printf("KCP→TCP %s: write %d bytes", target, pktLen)
-			if _, err := tcpConn.Write(buf[:pktLen]); err != nil {
-				return
+			host := string(pkt.Data[4 : 4+hostLen])
+			port := binary.BigEndian.Uint16(pkt.Data[4+hostLen:])
+			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
+			log.Printf("New session %s -> %s", clientAddr, target)
+
+			s = &session{clientAddr: clientAddr, target: target, lastSeen: time.Now()}
+			mu.Lock()
+			sessions[keyStr] = s
+			mu.Unlock()
+
+			// Connect on first data (not target info)
+			continue
+		}
+
+		s.lastSeen = time.Now()
+
+		// Forward data to target
+		if pkt.Data != nil {
+			if !writeToSession(s, pkt.Data) {
+				log.Printf("Write failed for %s", keyStr)
+				// Don't delete session — will retry on next packet
 			}
 		}
-	}()
-
-	// TCP → KCP: read response, send len + data
-	go func() {
-		defer wg.Done()
-		defer cancel()
-		buf := make([]byte, 4096)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			n, err := tcpConn.Read(buf)
-			if err != nil {
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					continue
-				}
-				return
-			}
-			// Send length prefix
-			log.Printf("TCP→KCP %s: write %d bytes", target, n)
-			if _, err := kcpConn.Write(buf[:n]); err != nil {
-				return
-			}
-		}
-	}()
-
-	wg.Wait()
-	log.Printf("Session %s -> %s closed", clientAddr, target)
+	}
 }
