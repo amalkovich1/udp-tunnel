@@ -3,7 +3,6 @@ package main
 import (
 	"crypto/cipher"
 	"flag"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -56,7 +55,7 @@ func main() {
 
 	var wg sync.WaitGroup
 
-	// Heartbeat goroutine
+	// Heartbeat
 	go func() {
 		hb := tunnel.Heartbeat()
 		for {
@@ -67,7 +66,6 @@ func main() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		<-sigCh
 		log.Println("Shutting down...")
@@ -84,7 +82,6 @@ func main() {
 		wg.Add(1)
 		go handleClient(clientConn, udpConn, aead, &wg)
 	}
-
 	wg.Wait()
 }
 
@@ -93,17 +90,14 @@ func handleClient(local net.Conn, remote *net.UDPConn, aead cipher.AEAD, wg *syn
 	defer wg.Done()
 
 	stats := tunnel.NewStats()
-
-	// Read from local TCP (from Xray or browser)
 	buf := make([]byte, 2048)
+
 	for {
 		local.SetReadDeadline(time.Now().Add(*timeout))
 		n, err := local.Read(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Idle timeout — print stats
-				log.Printf("Connection idle timeout, sent=%d recv=%d",
-					stats.BytesSent, stats.BytesReceived)
+				log.Printf("Connection idle timeout, sent=%d recv=%d", stats.BytesSent, stats.BytesReceived)
 				return
 			}
 			if err == io.EOF {
@@ -118,14 +112,12 @@ func handleClient(local net.Conn, remote *net.UDPConn, aead cipher.AEAD, wg *syn
 		enc := pkt.Encrypt(aead)
 		stats.BytesReceived += int64(len(data))
 
-		// Send encrypted to server
 		_, err = remote.Write(enc)
 		if err != nil {
 			log.Printf("Write to server error: %v", err)
 			return
 		}
 
-		// Read response from server (UDP)
 		respBuf := make([]byte, 2048)
 		remote.SetReadDeadline(time.Now().Add(30 * time.Second))
 		respN, err := remote.Read(respBuf)
@@ -147,7 +139,6 @@ func handleClient(local net.Conn, remote *net.UDPConn, aead cipher.AEAD, wg *syn
 
 		if respPkt.Data != nil {
 			stats.BytesSent += int64(len(respPkt.Data))
-			// Write response to local TCP
 			_, err = local.Write(respPkt.Data)
 			if err != nil {
 				log.Printf("Write to local error: %v", err)

@@ -1,9 +1,7 @@
 package main
 
 import (
-	"crypto/cipher"
-	"flag"
-	"fmt"
+		"flag"
 	"io"
 	"log"
 	"net"
