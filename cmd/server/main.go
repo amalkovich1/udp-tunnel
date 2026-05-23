@@ -87,7 +87,6 @@ func handleKCP(kcpConn *kcp.UDPSession) {
 				return
 			default:
 			}
-			kcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := kcpConn.Read(buf)
 			if err != nil {
 				return
@@ -109,7 +108,6 @@ func handleKCP(kcpConn *kcp.UDPSession) {
 				return
 			default:
 			}
-			tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := tcpConn.Read(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {

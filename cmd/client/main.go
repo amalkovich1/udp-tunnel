@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"sync"
-	"time"
 
 	"github.com/amalkovich1/udp-tunnel/pkg/tunnel"
 	kcp "github.com/xtaci/kcp-go"
@@ -130,7 +129,6 @@ func handle(client net.Conn) {
 				return
 			default:
 			}
-			client.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := client.Read(buf)
 			if err != nil {
 				return
@@ -152,7 +150,6 @@ func handle(client net.Conn) {
 				return
 			default:
 			}
-			kcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := kcpConn.Read(buf)
 			if err != nil {
 				return
