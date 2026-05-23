@@ -56,24 +56,22 @@ func main() {
 		os.Exit(0)
 	}()
 
-	var wg sync.WaitGroup
 	for {
 		client, err := listener.Accept()
 		if err != nil {
+			log.Printf("Accept error: %v", err)
 			break
 		}
-		wg.Add(1)
-		go handle(client, aead, serverUDP, &wg)
+		go handle(client, aead, serverUDP)
 	}
-	wg.Wait()
 }
 
-func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync.WaitGroup) {
+func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr) {
 	defer client.Close()
-	defer wg.Done()
+
+	buf := make([]byte, 4096)
 
 	// 1. SOCKS5 auth
-	buf := make([]byte, 4096)
 	_, err := io.ReadAtLeast(client, buf[:2], 2)
 	if err != nil {
 		return
@@ -85,7 +83,7 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync
 	}
 	client.Write([]byte{0x05, 0x00})
 
-	// 2. SOCKS5 request
+	// 2. Read SOCKS5 request
 	_, err = io.ReadAtLeast(client, buf[:4], 4)
 	if err != nil {
 		return
@@ -100,74 +98,97 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync
 	var port uint16
 	switch atyp {
 	case 1:
-		io.ReadFull(client, buf[:4])
+		_, err = io.ReadFull(client, buf[:4])
 		host = net.IP(buf[:4]).String()
 	case 3:
-		io.ReadFull(client, buf[:1])
-		len := buf[0]
-		io.ReadFull(client, buf[:len])
-		host = string(buf[:len])
+		_, err = io.ReadFull(client, buf[:1])
+		if err != nil {
+			return
+		}
+		hostLen := buf[0]
+		_, err = io.ReadFull(client, buf[:hostLen])
+		if err != nil {
+			return
+		}
+		host = string(buf[:hostLen])
 	case 4:
-		io.ReadFull(client, buf[:16])
+		_, err = io.ReadFull(client, buf[:16])
 		host = net.IP(buf[:16]).String()
 	}
-	io.ReadFull(client, buf[:2])
+	if err != nil {
+		return
+	}
+	_, err = io.ReadFull(client, buf[:2])
+	if err != nil {
+		return
+	}
 	port = binary.BigEndian.Uint16(buf[:2])
 	target := fmt.Sprintf("%s:%d", host, port)
 	log.Printf("CONNECT %s", target)
 
-	// 3. Connect to server via UDP
+	// 3. Connect to UDP server
 	remote, err := net.DialUDP("udp", nil, serverAddr)
 	if err != nil {
-		log.Printf("Dial UDP: %v", err)
 		return
 	}
 	defer remote.Close()
 
-	// Send target info
+	// 4. Send target info
 	hostBytes := []byte(host)
 	targetInfo := make([]byte, 4+len(hostBytes)+2)
 	binary.BigEndian.PutUint32(targetInfo[:4], uint32(len(hostBytes)))
 	copy(targetInfo[4:], hostBytes)
 	binary.BigEndian.PutUint16(targetInfo[4+len(hostBytes):], port)
-
 	tgtPkt := &tunnel.Packet{Data: targetInfo}
 	remote.Write(tgtPkt.Encrypt(aead))
 
-	// 4. Reply SOCKS5 OK
+	// 5. SOCKS5 OK
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 
-	// 5. Sequential relay: write then read
-	for {
-		// Read from SOCKS5 client
-		n, err := client.Read(buf)
-		if err != nil {
-			return
-		}
-		data := buf[:n]
+	// 6. Bidirectional relay
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-		// Encrypt & send UDP
-		pkt := &tunnel.Packet{Data: data}
-		remote.Write(pkt.Encrypt(aead))
-
-		// Read all response chunks from server
+	// UDP -> TCP: read responses from server, write to SOCKS5 client
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 4096)
 		for {
-			remote.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			respN, err := remote.Read(buf)
+			remote.SetReadDeadline(time.Now().Add(5 * time.Minute))
+			n, err := remote.Read(buf)
 			if err != nil {
-				break
+				return
 			}
-			raw := buf[:respN]
+			raw := buf[:n]
 			if tunnel.IsHeartbeat(raw) {
 				continue
 			}
-			respPkt, err := tunnel.DecryptPacket(raw, aead)
+			pkt, err := tunnel.DecryptPacket(raw, aead)
 			if err != nil {
 				continue
 			}
-			if respPkt.Data != nil {
-				client.Write(respPkt.Data)
+			if pkt.Data != nil {
+				_, err := client.Write(pkt.Data)
+				if err != nil {
+					return
+				}
 			}
 		}
-	}
+	}()
+
+	// TCP -> UDP: read from SOCKS5 client, send to server
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 4096)
+		for {
+			n, err := client.Read(buf)
+			if err != nil {
+				return
+			}
+			pkt := &tunnel.Packet{Data: buf[:n]}
+			remote.Write(pkt.Encrypt(aead))
+		}
+	}()
+
+	wg.Wait()
 }
