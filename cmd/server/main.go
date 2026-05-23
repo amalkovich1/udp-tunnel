@@ -1,21 +1,20 @@
 package main
 
 import (
-		"flag"
-	"io"
+	"encoding/binary"
+	"flag"
+	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/amalkovich1/udp-tunnel/pkg/tunnel"
 )
 
 var (
-	listenAddr  = flag.String("listen", ":40000", "UDP listen address")
-	targetAddr  = flag.String("target", "127.0.0.1:9443", "TCP target (Xray inbound)")
-	password    = flag.String("pass", "werther-tunnel-2026", "Encryption password")
-	timeout     = flag.Duration("timeout", 60*time.Second, "Connection idle timeout")
-	portRange   = flag.Bool("port-range", false, "Listen on random port 40000-44999")
+	listenAddr = flag.String("listen", ":40000", "UDP listen address")
+	password   = flag.String("pass", "werther-tunnel-2026", "Encryption password")
 )
 
 func main() {
@@ -27,12 +26,7 @@ func main() {
 		log.Fatalf("Failed to create AEAD: %v", err)
 	}
 
-	addr := *listenAddr
-	if *portRange {
-		addr = ":0"
-	}
-
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	udpAddr, err := net.ResolveUDPAddr("udp", *listenAddr)
 	if err != nil {
 		log.Fatalf("Resolve UDP: %v", err)
 	}
@@ -44,35 +38,33 @@ func main() {
 	defer conn.Close()
 
 	log.Printf("UDP tunnel server started on %s", conn.LocalAddr())
-	log.Printf("Forwarding to TCP target: %s", *targetAddr)
 	log.Printf("Encryption: ChaCha20-Poly1305")
 
-	// sessions map
 	type session struct {
 		clientAddr *net.UDPAddr
 		tcpConn    net.Conn
 		lastSeen   time.Time
-		stats      *tunnel.Stats
 	}
 	sessions := make(map[string]*session)
+	var mu sync.Mutex
 
-	buf := make([]byte, 2048)
+	buf := make([]byte, 4096)
 
 	for {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		n, clientAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// Timeout: cleanup stale sessions
+				mu.Lock()
 				now := time.Now()
 				for key, s := range sessions {
-					if now.Sub(s.lastSeen) > *timeout {
+					if now.Sub(s.lastSeen) > 5*time.Minute {
 						s.tcpConn.Close()
 						delete(sessions, key)
-						log.Printf("Session %s timed out (sent=%d recv=%d)",
-							key, s.stats.BytesSent, s.stats.BytesReceived)
+						log.Printf("Session %s timed out", key)
 					}
 				}
+				mu.Unlock()
 				continue
 			}
 			log.Printf("Read error: %v", err)
@@ -82,11 +74,12 @@ func main() {
 		raw := buf[:n]
 		keyStr := clientAddr.String()
 
-		// Heartbeat packet — just update lastSeen
 		if tunnel.IsHeartbeat(raw) {
+			mu.Lock()
 			if s, ok := sessions[keyStr]; ok {
 				s.lastSeen = time.Now()
 			}
+			mu.Unlock()
 			continue
 		}
 
@@ -96,63 +89,73 @@ func main() {
 			continue
 		}
 
+		mu.Lock()
 		s, exists := sessions[keyStr]
+		mu.Unlock()
+
 		if !exists {
-			// New session — connect to Xray
-			tcpConn, err := net.DialTimeout("tcp", *targetAddr, 5*time.Second)
-			if err != nil {
-				log.Printf("TCP dial to %s failed: %v", *targetAddr, err)
+			data := pkt.Data
+			if len(data) < 6 {
+				log.Printf("Bad initial packet from %s", clientAddr)
 				continue
 			}
+			hostLen := binary.BigEndian.Uint32(data[:4])
+			if len(data) < int(4+hostLen+2) {
+				log.Printf("Bad initial packet (short) from %s", clientAddr)
+				continue
+			}
+			host := string(data[4 : 4+hostLen])
+			port := binary.BigEndian.Uint16(data[4+hostLen:])
+			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+
+			log.Printf("New session %s -> %s", clientAddr, target)
+
+			tcpConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+			if err != nil {
+				log.Printf("TCP dial %s failed: %v", target, err)
+				continue
+			}
+
+			okPkt := &tunnel.Packet{Data: []byte{0}}
+			conn.WriteToUDP(okPkt.Encrypt(aead), clientAddr)
+
 			s = &session{
 				clientAddr: clientAddr,
 				tcpConn:    tcpConn,
 				lastSeen:   time.Now(),
-				stats:      tunnel.NewStats(),
 			}
+			mu.Lock()
 			sessions[keyStr] = s
-			log.Printf("New session from %s -> %s", clientAddr, *targetAddr)
+			mu.Unlock()
+
+			go func(s *session) {
+				buf := make([]byte, 4096)
+				for {
+					s.tcpConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+					n, err := s.tcpConn.Read(buf)
+					if err != nil {
+						mu.Lock()
+						delete(sessions, s.clientAddr.String())
+						mu.Unlock()
+						return
+					}
+					pkt := &tunnel.Packet{Data: buf[:n]}
+					conn.WriteToUDP(pkt.Encrypt(aead), s.clientAddr)
+				}
+			}(s)
 		}
+
 		s.lastSeen = time.Now()
 
 		if pkt.Data != nil {
-			s.stats.BytesReceived += int64(len(pkt.Data))
-			// Write to Xray
 			_, err := s.tcpConn.Write(pkt.Data)
 			if err != nil {
-				log.Printf("Write to Xray error: %v", err)
+				log.Printf("TCP write error for %s: %v", keyStr, err)
 				s.tcpConn.Close()
+				mu.Lock()
 				delete(sessions, keyStr)
-				continue
+				mu.Unlock()
 			}
 		}
-
-		// Read response from Xray (non-blocking attempt)
-		respBuf := make([]byte, 2048)
-		s.tcpConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		respN, err := s.tcpConn.Read(respBuf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-				if err != io.EOF {
-					log.Printf("Read from Xray error: %v", err)
-				}
-				s.tcpConn.Close()
-				delete(sessions, keyStr)
-				continue
-			}
-			// Timeout on read is OK — no response yet
-			continue
-		}
-
-		// Have response — encrypt and send back
-		respPkt := &tunnel.Packet{Data: respBuf[:respN]}
-		encResp := respPkt.Encrypt(aead)
-		s.stats.BytesSent += int64(len(respBuf[:respN]))
-		conn.WriteToUDP(encResp, clientAddr)
-	}
-
-	// Cleanup on exit
-	for _, s := range sessions {
-		s.tcpConn.Close()
 	}
 }
