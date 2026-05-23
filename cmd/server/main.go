@@ -1,10 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/amalkovich1/udp-tunnel/pkg/tunnel"
@@ -12,20 +13,12 @@ import (
 )
 
 func main() {
-	listenAddr := ":40000"
-
-	block, err := kcp.NewNoneBlockCrypt(nil)
-	if err != nil {
-		log.Fatalf("KCP crypt: %v", err)
-	}
-	lis, err := kcp.ListenWithOptions(listenAddr, block, 0, 0)
+	lis, err := kcp.ListenWithOptions(":40000", mustBlockCrypt(), 0, 0)
 	if err != nil {
 		log.Fatalf("KCP listen: %v", err)
 	}
 	defer lis.Close()
-
-	log.Printf("KCP tunnel server on %s", listenAddr)
-	log.Printf("Waiting for KCP sessions...")
+	log.Printf("KCP tunnel server on :40000")
 
 	for {
 		conn, err := lis.AcceptKCP()
@@ -33,90 +26,103 @@ func main() {
 			log.Printf("Accept: %v", err)
 			continue
 		}
-
-		// Fast mode: no delay, fast retransmit
 		conn.SetNoDelay(1, 10, 2, 1)
 		conn.SetWindowSize(1024, 1024)
 		conn.SetMtu(1400)
 		conn.SetACKNoDelay(true)
 
-		clientAddr := conn.RemoteAddr().String()
-		log.Printf("New KCP session from %s", clientAddr)
-
-		go handleKCP(conn, clientAddr)
+		go handleKCP(conn)
 	}
 }
 
-func handleKCP(kcpConn *kcp.UDPSession, clientAddr string) {
+func mustBlockCrypt() kcp.BlockCrypt {
+	bc, err := kcp.NewNoneBlockCrypt(nil)
+	if err != nil {
+		log.Fatalf("KCP crypt: %v", err)
+	}
+	return bc
+}
+
+func handleKCP(kcpConn *kcp.UDPSession) {
+	clientAddr := kcpConn.RemoteAddr().String()
 	defer kcpConn.Close()
 
-	// 1. Read target info first
+	// Read target info
 	buf := make([]byte, 4096)
 	n, err := kcpConn.Read(buf)
 	if err != nil {
-		log.Printf("Read target info from %s: %v", clientAddr, err)
 		return
 	}
-
 	host, port, err := tunnel.DecodeTargetInfo(buf[:n])
 	if err != nil {
-		log.Printf("Bad target info from %s: %v", clientAddr, err)
 		return
 	}
-
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	log.Printf("Session %s -> %s", clientAddr, target)
+	log.Printf("KCP %s -> %s", clientAddr, target)
 
-	// 2. Connect to target
+	// Connect to target via TCP
 	tcpConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		log.Printf("TCP dial %s: %v", target, err)
 		return
 	}
 	defer tcpConn.Close()
+	log.Printf("TCP %s connected", target)
 
-	// 3. Bidirectional relay
-	done := make(chan struct{}, 2)
+	// Bidirectional relay with context cancellation
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	// KCP → TCP
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// KCP → TCP: read from client, write to target
 	go func() {
-		defer func() { done <- struct{}{} }()
+		defer wg.Done()
+		defer cancel()
 		buf := make([]byte, 4096)
 		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			kcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := kcpConn.Read(buf)
 			if err != nil {
 				return
 			}
-			_, err = tcpConn.Write(buf[:n])
-			if err != nil {
+			if _, err := tcpConn.Write(buf[:n]); err != nil {
 				return
 			}
 		}
 	}()
 
-	// TCP → KCP
+	// TCP → KCP: read response from target, write back to client
 	go func() {
-		defer func() { done <- struct{}{} }()
+		defer wg.Done()
+		defer cancel()
 		buf := make([]byte, 4096)
 		for {
-			tcpConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			tcpConn.SetReadDeadline(time.Now().Add(30 * time.Second))
 			n, err := tcpConn.Read(buf)
 			if err != nil {
-				if err != io.EOF {
-					// Timeout is OK
-					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						continue
-					}
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					continue
 				}
 				return
 			}
-			_, err = kcpConn.Write(buf[:n])
-			if err != nil {
+			if _, err := kcpConn.Write(buf[:n]); err != nil {
 				return
 			}
 		}
 	}()
 
-	<-done
-	log.Printf("Session %s closed", clientAddr)
+	wg.Wait()
+	log.Printf("Session %s -> %s closed", clientAddr, target)
 }
