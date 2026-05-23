@@ -52,6 +52,7 @@ func mustKCP() *kcp.UDPSession {
 	conn.SetWindowSize(1024, 1024)
 	conn.SetMtu(1400)
 	conn.SetACKNoDelay(true)
+	conn.SetStreamMode(false)
 	return conn
 }
 
