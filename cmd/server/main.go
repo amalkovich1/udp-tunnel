@@ -116,7 +116,6 @@ func main() {
 				continue
 			}
 
-			
 			s = &session{
 				clientAddr: clientAddr,
 				tcpConn:    tcpConn,
@@ -126,6 +125,7 @@ func main() {
 			sessions[keyStr] = s
 			mu.Unlock()
 
+			// Goroutine: TCP -> UDP (responses back to client)
 			go func(s *session) {
 				buf := make([]byte, 4096)
 				for {
@@ -141,10 +141,14 @@ func main() {
 					conn.WriteToUDP(pkt.Encrypt(aead), s.clientAddr)
 				}
 			}(s)
+
+			// Don't write target info to TCP connection
+			continue
 		}
 
 		s.lastSeen = time.Now()
 
+		// Forward data to target
 		if pkt.Data != nil {
 			_, err := s.tcpConn.Write(pkt.Data)
 			if err != nil {
