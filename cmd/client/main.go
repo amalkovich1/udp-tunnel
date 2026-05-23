@@ -21,7 +21,6 @@ var (
 
 func main() {
 	flag.Parse()
-
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
 		log.Fatalf("Listen TCP: %v", err)
@@ -39,11 +38,8 @@ func main() {
 }
 
 func mustKCP() *kcp.UDPSession {
-	bc, err := kcp.NewNoneBlockCrypt(nil)
-	if err != nil {
-		log.Fatalf("KCP crypt: %v", err)
-	}
-	conn, err := kcp.DialWithOptions(*serverAddr, bc, 0, 0)
+	block, _ := kcp.NewNoneBlockCrypt(nil)
+	conn, err := kcp.DialWithOptions(*serverAddr, block, 0, 0)
 	if err != nil {
 		log.Fatalf("KCP dial: %v", err)
 	}
@@ -57,7 +53,6 @@ func mustKCP() *kcp.UDPSession {
 
 func handle(client net.Conn) {
 	defer client.Close()
-
 	buf := make([]byte, 4096)
 
 	// SOCKS5 auth
@@ -78,7 +73,6 @@ func handle(client net.Conn) {
 		client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		return
 	}
-
 	var host string
 	var port uint16
 	switch buf[3] {
@@ -96,29 +90,21 @@ func handle(client net.Conn) {
 	}
 	io.ReadFull(client, buf[:2])
 	port = binary.BigEndian.Uint16(buf[:2])
-	target := fmt.Sprintf("%s:%d", host, port)
-	log.Printf("CONNECT %s", target)
+	log.Printf("CONNECT %s", fmt.Sprintf("%s:%d", host, port))
 
-	// Connect via KCP
 	kcpConn := mustKCP()
 	defer kcpConn.Close()
 
 	// Send target info
-	if _, err := kcpConn.Write(tunnel.EncodeTargetInfo(host, port)); err != nil {
-		return
-	}
-
-	// SOCKS5 OK
+	kcpConn.Write(tunnel.EncodeTargetInfo(host, port))
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 
-	// Bidirectional relay
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// SOCKS5 → KCP
+	// SOCKS5 → KCP: read data, send len + data
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -133,13 +119,17 @@ func handle(client net.Conn) {
 			if err != nil {
 				return
 			}
+			lenPref := []byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+			if _, err := kcpConn.Write(lenPref); err != nil {
+				return
+			}
 			if _, err := kcpConn.Write(buf[:n]); err != nil {
 				return
 			}
 		}
 	}()
 
-	// KCP → SOCKS5
+	// KCP → SOCKS5: read len + data, write to client
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -150,16 +140,21 @@ func handle(client net.Conn) {
 				return
 			default:
 			}
-			n, err := kcpConn.Read(buf)
-			if err != nil {
+			if _, err := kcpConn.Read(buf[:4]); err != nil {
 				return
 			}
-			if _, err := client.Write(buf[:n]); err != nil {
+			pktLen := int(buf[0])<<24 | int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])
+			if pktLen < 1 || pktLen > 4096 {
+				return
+			}
+			if _, err := kcpConn.Read(buf[:pktLen]); err != nil {
+				return
+			}
+			if _, err := client.Write(buf[:pktLen]); err != nil {
 				return
 			}
 		}
 	}()
 
 	wg.Wait()
-	log.Printf("Disconnected %s", target)
 }

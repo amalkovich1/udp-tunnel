@@ -13,7 +13,8 @@ import (
 )
 
 func main() {
-	lis, err := kcp.ListenWithOptions(":40000", mustBlockCrypt(), 0, 0)
+	block, _ := kcp.NewNoneBlockCrypt(nil)
+	lis, err := kcp.ListenWithOptions(":40000", block, 0, 0)
 	if err != nil {
 		log.Fatalf("KCP listen: %v", err)
 	}
@@ -23,31 +24,21 @@ func main() {
 	for {
 		conn, err := lis.AcceptKCP()
 		if err != nil {
-			log.Printf("Accept: %v", err)
 			continue
 		}
 		conn.SetNoDelay(1, 10, 2, 1)
 		conn.SetWindowSize(1024, 1024)
 		conn.SetMtu(1400)
 		conn.SetACKNoDelay(true)
-
+		conn.SetStreamMode(false)
 		go handleKCP(conn)
 	}
-}
-
-func mustBlockCrypt() kcp.BlockCrypt {
-	bc, err := kcp.NewNoneBlockCrypt(nil)
-	if err != nil {
-		log.Fatalf("KCP crypt: %v", err)
-	}
-	return bc
 }
 
 func handleKCP(kcpConn *kcp.UDPSession) {
 	clientAddr := kcpConn.RemoteAddr().String()
 	defer kcpConn.Close()
 
-	// Read target info
 	buf := make([]byte, 4096)
 	n, err := kcpConn.Read(buf)
 	if err != nil {
@@ -60,23 +51,19 @@ func handleKCP(kcpConn *kcp.UDPSession) {
 	target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 	log.Printf("KCP %s -> %s", clientAddr, target)
 
-	// Connect to target via TCP
 	tcpConn, err := net.DialTimeout("tcp", target, 10*time.Second)
 	if err != nil {
 		log.Printf("TCP dial %s: %v", target, err)
 		return
 	}
 	defer tcpConn.Close()
-	log.Printf("TCP %s connected", target)
 
-	// Bidirectional relay with context cancellation
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// KCP → TCP: read from client, write to target
+	// KCP → TCP: read len + data, write to target
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -87,17 +74,26 @@ func handleKCP(kcpConn *kcp.UDPSession) {
 				return
 			default:
 			}
-			n, err := kcpConn.Read(buf)
-			if err != nil {
+			// Read 4 bytes length prefix
+			if _, err := kcpConn.Read(buf[:4]); err != nil {
 				return
 			}
-			if _, err := tcpConn.Write(buf[:n]); err != nil {
+			pktLen := int(buf[0])<<24 | int(buf[1])<<16 | int(buf[2])<<8 | int(buf[3])
+			if pktLen < 1 || pktLen > 4096 {
+				return
+			}
+			// Read data
+			if _, err := kcpConn.Read(buf[:pktLen]); err != nil {
+				return
+			}
+			log.Printf("KCP→TCP %s: write %d bytes", target, pktLen)
+			if _, err := tcpConn.Write(buf[:pktLen]); err != nil {
 				return
 			}
 		}
 	}()
 
-	// TCP → KCP: read response from target, write back to client
+	// TCP → KCP: read response, send len + data
 	go func() {
 		defer wg.Done()
 		defer cancel()
@@ -115,6 +111,12 @@ func handleKCP(kcpConn *kcp.UDPSession) {
 				}
 				return
 			}
+			// Send length prefix
+			lenPref := []byte{byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}
+			if _, err := kcpConn.Write(lenPref); err != nil {
+				return
+			}
+			log.Printf("TCP→KCP %s: write %d bytes", target, n)
 			if _, err := kcpConn.Write(buf[:n]); err != nil {
 				return
 			}
