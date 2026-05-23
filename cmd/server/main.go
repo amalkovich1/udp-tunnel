@@ -116,9 +116,7 @@ func main() {
 				continue
 			}
 
-			okPkt := &tunnel.Packet{Data: []byte{0}}
-			conn.WriteToUDP(okPkt.Encrypt(aead), clientAddr)
-
+			
 			s = &session{
 				clientAddr: clientAddr,
 				tcpConn:    tcpConn,
