@@ -73,7 +73,7 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync
 	defer wg.Done()
 
 	// 1. SOCKS5 auth
-	buf := make([]byte, 512)
+	buf := make([]byte, 4096)
 	_, err := io.ReadAtLeast(client, buf[:2], 2)
 	if err != nil {
 		return
@@ -150,22 +150,24 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync
 		pkt := &tunnel.Packet{Data: data}
 		remote.Write(pkt.Encrypt(aead))
 
-		// Wait for response from server (UDP)
-		remote.SetReadDeadline(time.Now().Add(30 * time.Second))
-		respN, err := remote.Read(buf)
-		if err != nil {
-			return
-		}
-		raw := buf[:respN]
-		if tunnel.IsHeartbeat(raw) {
-			continue
-		}
-		respPkt, err := tunnel.DecryptPacket(raw, aead)
-		if err != nil {
-			continue
-		}
-		if respPkt.Data != nil {
-			client.Write(respPkt.Data)
+		// Read all response chunks from server
+		for {
+			remote.SetReadDeadline(time.Now().Add(2 * time.Second))
+			respN, err := remote.Read(buf)
+			if err != nil {
+				break
+			}
+			raw := buf[:respN]
+			if tunnel.IsHeartbeat(raw) {
+				continue
+			}
+			respPkt, err := tunnel.DecryptPacket(raw, aead)
+			if err != nil {
+				continue
+			}
+			if respPkt.Data != nil {
+				client.Write(respPkt.Data)
+			}
 		}
 	}
 }

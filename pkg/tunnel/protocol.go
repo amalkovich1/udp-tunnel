@@ -15,7 +15,7 @@ const (
 	IVSize   = 12
 	MACSize  = 16
 	KeySize  = 32            // ChaCha20-Poly1305 key
-	MaxLen   = 1500          // Max UDP payload
+	MaxLen = 1300          // Max UDP payload
 	HeaderLen = 4            // 4 bytes: data length
 )
 

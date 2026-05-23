@@ -42,13 +42,63 @@ func main() {
 
 	type session struct {
 		clientAddr *net.UDPAddr
+		target     string
 		tcpConn    net.Conn
 		lastSeen   time.Time
+		mu         sync.Mutex
 	}
 	sessions := make(map[string]*session)
 	var mu sync.Mutex
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, 1400)
+
+	// Helper: ensure TCP connection is alive, reconnect if needed
+	ensureConn := func(s *session) (net.Conn, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.tcpConn != nil {
+			return s.tcpConn, nil
+		}
+		tcpConn, err := net.DialTimeout("tcp", s.target, 10*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		s.tcpConn = tcpConn
+		// Start reader goroutine for new connection
+		go func(s *session) {
+			buf := make([]byte, 1400)
+			for {
+				tcpConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
+				n, err := tcpConn.Read(buf)
+				if err != nil {
+					s.mu.Lock()
+					tcpConn.Close()
+					s.tcpConn = nil // mark as closed, will reconnect on next write
+					s.mu.Unlock()
+					return
+				}
+				pkt := &tunnel.Packet{Data: buf[:n]}
+				conn.WriteToUDP(pkt.Encrypt(aead), s.clientAddr)
+			}
+		}(s)
+		return tcpConn, nil
+	}
+
+	writeToSession := func(s *session, data []byte) bool {
+		tcpConn, err := ensureConn(s)
+		if err != nil {
+			return false
+		}
+		_, err = tcpConn.Write(data)
+		if err != nil {
+			tcpConn.Close()
+			s.mu.Lock()
+			s.tcpConn = nil
+			s.mu.Unlock()
+			return false
+		}
+		return true
+	}
 
 	for {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
@@ -59,7 +109,11 @@ func main() {
 				now := time.Now()
 				for key, s := range sessions {
 					if now.Sub(s.lastSeen) > 5*time.Minute {
-						s.tcpConn.Close()
+						s.mu.Lock()
+						if s.tcpConn != nil {
+							s.tcpConn.Close()
+						}
+						s.mu.Unlock()
 						delete(sessions, key)
 						log.Printf("Session %s timed out", key)
 					}
@@ -94,55 +148,26 @@ func main() {
 		mu.Unlock()
 
 		if !exists {
-			data := pkt.Data
-			if len(data) < 6 {
+			if len(pkt.Data) < 6 {
 				log.Printf("Bad initial packet from %s", clientAddr)
 				continue
 			}
-			hostLen := binary.BigEndian.Uint32(data[:4])
-			if len(data) < int(4+hostLen+2) {
-				log.Printf("Bad initial packet (short) from %s", clientAddr)
+			hostLen := binary.BigEndian.Uint32(pkt.Data[:4])
+			if len(pkt.Data) < int(4+hostLen+2) {
 				continue
 			}
-			host := string(data[4 : 4+hostLen])
-			port := binary.BigEndian.Uint16(data[4+hostLen:])
+			host := string(pkt.Data[4 : 4+hostLen])
+			port := binary.BigEndian.Uint16(pkt.Data[4+hostLen:])
 			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 
 			log.Printf("New session %s -> %s", clientAddr, target)
 
-			tcpConn, err := net.DialTimeout("tcp", target, 10*time.Second)
-			if err != nil {
-				log.Printf("TCP dial %s failed: %v", target, err)
-				continue
-			}
-
-			s = &session{
-				clientAddr: clientAddr,
-				tcpConn:    tcpConn,
-				lastSeen:   time.Now(),
-			}
+			s = &session{clientAddr: clientAddr, target: target, lastSeen: time.Now()}
 			mu.Lock()
 			sessions[keyStr] = s
 			mu.Unlock()
 
-			// Goroutine: TCP -> UDP (responses back to client)
-			go func(s *session) {
-				buf := make([]byte, 4096)
-				for {
-					s.tcpConn.SetReadDeadline(time.Now().Add(2 * time.Minute))
-					n, err := s.tcpConn.Read(buf)
-					if err != nil {
-						mu.Lock()
-						delete(sessions, s.clientAddr.String())
-						mu.Unlock()
-						return
-					}
-					pkt := &tunnel.Packet{Data: buf[:n]}
-					conn.WriteToUDP(pkt.Encrypt(aead), s.clientAddr)
-				}
-			}(s)
-
-			// Don't write target info to TCP connection
+			// Connect on first data (not target info)
 			continue
 		}
 
@@ -150,13 +175,9 @@ func main() {
 
 		// Forward data to target
 		if pkt.Data != nil {
-			_, err := s.tcpConn.Write(pkt.Data)
-			if err != nil {
-				log.Printf("TCP write error for %s: %v", keyStr, err)
-				s.tcpConn.Close()
-				mu.Lock()
-				delete(sessions, keyStr)
-				mu.Unlock()
+			if !writeToSession(s, pkt.Data) {
+				log.Printf("Write failed for %s", keyStr)
+				// Don't delete session — will retry on next packet
 			}
 		}
 	}
