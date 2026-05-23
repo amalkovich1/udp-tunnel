@@ -152,7 +152,7 @@ func handle(client net.Conn, aead cipher.AEAD, serverAddr *net.UDPAddr, wg *sync
 
 		// Read all response chunks from server
 		for {
-			remote.SetReadDeadline(time.Now().Add(2 * time.Second))
+			remote.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 			respN, err := remote.Read(buf)
 			if err != nil {
 				break
